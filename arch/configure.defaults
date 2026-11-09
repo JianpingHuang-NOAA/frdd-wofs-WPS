@@ -274,7 +274,7 @@ COMPRESSION_INC     = CONFIGURE_COMP_I
 FDEFS               = CONFIGURE_FDEFS
 SFC                 = ifort
 SCC                 = icc
-DM_FC               = mpif90
+DM_FC               = mpif90 -f90=$(SFC)
 DM_CC               = mpicc
 FC                  = CONFIGURE_FC
 CC                  = CONFIGURE_CC
