@@ -1,82 +1,109 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #SBATCH --job-name=build_wps_ursa
+#SBATCH --partition=u1-compute
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=build_wps_%j.out
 #SBATCH --error=build_wps_%j.err
 
 set -euo pipefail
 
-# Resolve the repository root from HOMEwofs or the submission directory.
-if [[ -n "${HOMEwofs:-}" ]]; then
-    HOMEwofs="$(cd "$HOMEwofs" && pwd -P)"
-elif [[ -f "${SLURM_SUBMIT_DIR:-}/versions/build.ver" ]]; then
-    HOMEwofs="$(cd "$SLURM_SUBMIT_DIR" && pwd -P)"
-elif [[ -f "${SLURM_SUBMIT_DIR:-}/../../versions/build.ver" ]]; then
-    HOMEwofs="$(cd "$SLURM_SUBMIT_DIR/../.." && pwd -P)"
-else
-    echo "[ERROR] Cannot determine HOMEwofs" >&2
+die() {
+    echo "[ERROR] $*" >&2
     exit 1
+}
+
+info() {
+    echo "[INFO] $*"
+}
+
+[[ -n "${SLURM_JOB_ID:-}" ]] ||
+    die "Submit using sbatch."
+
+# ------------------------------------------------------------
+# 1. Resolve WoFS repository root
+# ------------------------------------------------------------
+
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:?}"
+
+if [[ -n "${HOMEwofs:-}" ]]; then
+    :
+elif [[ -f "$SUBMIT_DIR/versions/build.ver" ]]; then
+    HOMEwofs="$SUBMIT_DIR"
+elif [[ -f "$SUBMIT_DIR/../../versions/build.ver" ]]; then
+    HOMEwofs="$SUBMIT_DIR/../.."
+else
+    die "Cannot determine HOMEwofs. Set HOMEwofs explicitly."
 fi
+
+HOMEwofs="$(cd "$HOMEwofs" && pwd -P)"
 
 WPS_SOURCE_DIR="${WPS_SOURCE_DIR:-$HOMEwofs/sorc/WPS}"
-WRF_BUILD_DIR="${WRF_BUILD_DIR:-$HOMEwofs/staging/WRF_build_nco_test_20261108_v2}"
-: "${WPS_BUILD_DIR:?Set WPS_BUILD_DIR to a new staging directory}"
-
 WPS_SOURCE_DIR="$(cd "$WPS_SOURCE_DIR" && pwd -P)"
+
+: "${WRF_BUILD_DIR:?Set WRF_BUILD_DIR to completed WRF build root}"
+
 WRF_BUILD_DIR="$(cd "$WRF_BUILD_DIR" && pwd -P)"
+
+WPS_BUILD_DIR="${WPS_BUILD_DIR:-$HOMEwofs/staging/WPS_build_${SLURM_JOB_ID}}"
 WPS_BUILD_DIR="$(realpath -m "$WPS_BUILD_DIR")"
 
-SCRIPT_DIR="$WPS_SOURCE_DIR"
+info "HOMEwofs=$HOMEwofs"
+info "WPS_SOURCE_DIR=$WPS_SOURCE_DIR"
+info "WRF_BUILD_DIR=$WRF_BUILD_DIR"
+info "WPS_BUILD_DIR=$WPS_BUILD_DIR"
 
-echo "===== WPS build paths ====="
-echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-N/A}"
-echo "SCRIPT_DIR=$SCRIPT_DIR"
-echo "HOMEwofs=$HOMEwofs"
-echo "WPS_SOURCE_DIR=$WPS_SOURCE_DIR"
-echo "WRF_BUILD_DIR=$WRF_BUILD_DIR"
-echo "WPS_BUILD_DIR=$WPS_BUILD_DIR"
+[[ -f "$WPS_SOURCE_DIR/configure" ]] ||
+    die "Missing WPS configure script"
 
-echo
-echo "===== Verify WRF build ====="
+[[ -f "$WPS_SOURCE_DIR/compile" ]] ||
+    die "Missing WPS compile script"
 
-if [[ ! -f "$WRF_BUILD_DIR/external/io_netcdf/libwrfio_nf.a" ]]; then
-    echo "[ERROR] WRF NetCDF I/O library not found"
-    exit 1
-fi
+# ------------------------------------------------------------
+# 2. Load centralized Ursa build environment
+# ------------------------------------------------------------
 
-
-# Avoid modifying an existing staging build.
-if [[ -e "$WPS_BUILD_DIR" || -L "$WPS_BUILD_DIR" ]]; then
-    echo "[ERROR] Build directory already exists: $WPS_BUILD_DIR"
-    exit 1
-fi
-
-# Load the reproducible build environment.
-# Load centralized WoFS build dependency versions.
 BUILD_VER="$HOMEwofs/versions/build.ver"
+MODULE_DIR="$HOMEwofs/modulefiles"
 
-if [[ ! -f "$BUILD_VER" ]]; then
-    echo "[ERROR] Missing build version file: $BUILD_VER" >&2
-    exit 1
-fi
+[[ -f "$BUILD_VER" ]] ||
+    die "Missing $BUILD_VER"
+
+[[ -f "$MODULE_DIR/ursa_wps.lua" ]] ||
+    die "Missing $MODULE_DIR/ursa_wps.lua"
 
 source "$BUILD_VER"
-echo "[INFO] Loaded build versions: $BUILD_VER"
+
+set +u
+if [[ -f /etc/profile.d/modules.sh ]]; then
+    source /etc/profile.d/modules.sh
+fi
 
 module purge
-module use "$HOMEwofs/modulefiles"
+module use "$MODULE_DIR"
 module load ursa_wps
+set -u
 
-for var in NETCDF_C NETCDF_FORTRAN JASPERLIB JASPERINC PNG_LIB PNG_INC; do
-    if [[ -z "${!var:-}" ]]; then
-        echo "[ERROR] Missing environment variable: $var"
-        exit 1
-    fi
+for cmd in tar make ifort icc mpif90 \
+           nc-config nf-config ldd timeout; do
+    command -v "$cmd" >/dev/null ||
+        die "Missing command: $cmd"
 done
+
+for var in NETCDF_C NETCDF_FORTRAN \
+           JASPERLIB JASPERINC PNG_LIB PNG_INC; do
+    [[ -n "${!var:-}" ]] ||
+        die "Missing environment variable: $var"
+done
+
+# ------------------------------------------------------------
+# 3. Validate previously completed WRF build
+# ------------------------------------------------------------
+
+info "Checking WRF build libraries"
 
 for lib in \
     external/io_netcdf/libwrfio_nf.a \
@@ -84,40 +111,65 @@ for lib in \
     external/io_grib_share/libio_grib_share.a \
     external/io_int/libwrfio_int.a
 do
-    [[ -f "$WRF_BUILD_DIR/$lib" ]] || {
-        echo "[ERROR] Missing WRF library: $lib"
-        exit 1
-    }
+    [[ -s "$WRF_BUILD_DIR/$lib" ]] ||
+        die "Missing WRF library: $lib"
 done
 
-mkdir -p "$WPS_BUILD_DIR"/{logs,netcdf_combined/include,netcdf_combined/lib}
+[[ -s "$WRF_BUILD_DIR/configure.wrf" ]] ||
+    die "Missing WRF configure.wrf"
 
-# Copy the current source tree, including the uncommitted Ursa fixes.
-# Exclude generated binaries, objects, and prior configuration.
+info "WRF libraries verified"
+
+# ------------------------------------------------------------
+# 4. Create isolated WPS build directory
+# ------------------------------------------------------------
+
+[[ ! -e "$WPS_BUILD_DIR" && ! -L "$WPS_BUILD_DIR" ]] ||
+    die "WPS build directory already exists: $WPS_BUILD_DIR"
+
+# Prevent staging inside the source directory.
+case "$WPS_BUILD_DIR/" in
+    "$WPS_SOURCE_DIR/"*)
+        die "WPS build directory cannot be inside WPS source"
+        ;;
+esac
+
+mkdir -p "$WPS_BUILD_DIR/logs"
+mkdir -p "$WPS_BUILD_DIR/netcdf_combined/include"
+mkdir -p "$WPS_BUILD_DIR/netcdf_combined/lib"
+
+info "Copying WPS source"
+
 tar -C "$WPS_SOURCE_DIR" \
     --exclude=.git \
     --exclude=configure.wps \
     --exclude=compile.log \
+    --exclude=build_logs \
     --exclude='*.exe' \
     --exclude='*.o' \
     --exclude='*.a' \
     --exclude='*.mod' \
     --exclude='*.log' \
-    --exclude='*.log.*' \
-    -cf - . | tar -C "$WPS_BUILD_DIR" -xf -
+    -cf - . |
+tar -C "$WPS_BUILD_DIR" -xf -
 
-# WPS expects WRF_DIR relative to its build directory.
+# ------------------------------------------------------------
+# 5. Prepare combined NetCDF interface
+# ------------------------------------------------------------
 
-# Create a combined NetCDF interface using symbolic links.
 for prefix in "$NETCDF_C" "$NETCDF_FORTRAN"; do
     for file in "$prefix"/include/*; do
         [[ -e "$file" ]] || continue
-        ln -s "$file" "$WPS_BUILD_DIR/netcdf_combined/include/$(basename "$file")" 2>/dev/null || true
+        ln -s "$file" \
+            "$WPS_BUILD_DIR/netcdf_combined/include/$(basename "$file")" \
+            2>/dev/null || true
     done
 
     for file in "$prefix"/lib/libnetcdf*; do
         [[ -e "$file" ]] || continue
-        ln -s "$file" "$WPS_BUILD_DIR/netcdf_combined/lib/$(basename "$file")" 2>/dev/null || true
+        ln -s "$file" \
+            "$WPS_BUILD_DIR/netcdf_combined/lib/$(basename "$file")" \
+            2>/dev/null || true
     done
 done
 
@@ -128,63 +180,101 @@ export JASPERLIB JASPERINC
 cd "$WPS_BUILD_DIR"
 
 {
+    echo "Date: $(date)"
+    echo "Job: $SLURM_JOB_ID"
+    echo "WoFS root: $HOMEwofs"
     echo "WPS source: $WPS_SOURCE_DIR"
     echo "WRF build: $WRF_BUILD_DIR"
     echo "NetCDF-C: $NETCDF_C"
     echo "NetCDF-Fortran: $NETCDF_FORTRAN"
     echo "Jasper: $JASPERLIB"
     echo "PNG: $PNG_LIB"
-    git -C "$WPS_SOURCE_DIR" rev-parse HEAD
+    git -C "$WPS_SOURCE_DIR" rev-parse HEAD || true
     module list
 } > logs/build_environment.log 2>&1
 
-# Select the Intel dmpar architecture with GRIB2 enabled.
-# Determine its menu number dynamically from the architecture listing.
+# ------------------------------------------------------------
+# 6. Configure WPS
+# ------------------------------------------------------------
 
-# ============================================================
-# Configure WPS using Intel MPI with GRIB2 support
-# ============================================================
+WPS_CONFIG_OPTION="${WPS_CONFIG_OPTION:-19}"
 
-echo "[INFO] Configuring WPS with Intel dmpar (option 19)"
+info "Configuring WPS: option $WPS_CONFIG_OPTION"
 
-printf '19\n' | timeout 120 ./configure > logs/configure.log 2>&1
-
-if [[ ! -s configure.wps ]]; then
-    echo "[ERROR] WPS configure.wps was not generated."
-    tail -50 logs/configure.log
-    exit 1
+if ! printf '%s\n' "$WPS_CONFIG_OPTION" |
+    timeout 120 ./configure > logs/configure.log 2>&1; then
+    tail -100 logs/configure.log
+    die "WPS configuration failed"
 fi
 
-# ============================================================
-# Step 3: Correct the WRF and compression library paths
-# ============================================================
+[[ -s configure.wps ]] || {
+    tail -100 logs/configure.log
+    die "configure.wps not generated"
+}
 
-# Use the validated WRF build.
 sed -i \
     "s|^WRF_DIR[[:space:]]*=.*|WRF_DIR = ${WRF_BUILD_DIR}|" \
     configure.wps
 
-# Set Jasper and PNG libraries.
 sed -i \
     "s|^COMPRESSION_LIBS[[:space:]]*=.*|COMPRESSION_LIBS = -L${JASPERLIB} -ljasper -L${PNG_LIB} -lpng -lz|" \
     configure.wps
 
-# Set Jasper and PNG headers.
 sed -i \
     "s|^COMPRESSION_INC[[:space:]]*=.*|COMPRESSION_INC = -I${JASPERINC} -I${PNG_INC}|" \
     configure.wps
 
-# ============================================================
-# Step 4: Verify generated WPS configuration
-# ============================================================
+cp configure.wps logs/configure.wps.verified
 
-echo "===== WPS configuration ====="
+info "WPS configuration completed"
 
-grep -E \
-    '^(WRF_DIR|COMPRESSION_LIBS|COMPRESSION_INC|SFC|SCC|DM_FC|DM_CC|FDEFS)[[:space:]]*=' \
-    configure.wps
+# ------------------------------------------------------------
+# 7. Compile WPS
+# ------------------------------------------------------------
+
+info "Starting WPS compilation"
+
+export J="-j ${SLURM_CPUS_PER_TASK:-8}"
+
+if ! ./compile > logs/compile.log 2>&1; then
+    tail -150 logs/compile.log
+    die "WPS compilation failed"
+fi
+
+info "WPS compilation finished"
+
+# ------------------------------------------------------------
+# 8. Validate executables
+# ------------------------------------------------------------
+
+FAILED=0
+
+for exe in geogrid ungrib metgrid; do
+    FILE="$WPS_BUILD_DIR/$exe/src/$exe.exe"
+
+    if [[ ! -x "$FILE" ]]; then
+        echo "[FAIL] Missing executable: $FILE"
+        FAILED=1
+        continue
+    fi
+
+    if ldd "$FILE" | grep -q "not found"; then
+        echo "[FAIL] Missing shared libraries: $FILE"
+        ldd "$FILE"
+        FAILED=1
+        continue
+    fi
+
+    echo "[PASS] $exe"
+    ls -lh "$FILE"
+done
+
+[[ "$FAILED" -eq 0 ]] ||
+    die "WPS executable validation failed"
 
 echo
-echo "[INFO] WPS configuration completed successfully."
-echo "[INFO] Build directory: $WPS_BUILD_DIR"
-
+echo "=========================================="
+echo "[PASS] WPS build completed successfully"
+echo "WRF: $WRF_BUILD_DIR"
+echo "WPS: $WPS_BUILD_DIR"
+echo "=========================================="
